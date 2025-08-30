@@ -68,6 +68,15 @@ app.post('/upload', upload.single('csvfile'), async (req, res) => {
         Deleted Rows: ${summary.deletedCount}
         Skipped Rows: ${summary.skippedRows}
       `);
+    } else if (tableName === 'unduplicatedpatients') {
+      const summary = await importUnduplicatedPatients(filePath, tableName);
+      return res.send(`
+        ✅ UnduplicatedPatients Done!
+        Processed Rows: ${summary.processedRows}
+        Inserted/Updated: ${summary.insertedOrUpdated}
+        Deleted Rows: ${summary.deletedCount}
+        Skipped Rows: ${summary.skippedRows}
+      `);
     } else {
       fs.unlinkSync(filePath);
       return res.status(400).send('❌ Unknown table selected.');
@@ -194,15 +203,15 @@ async function importMainTable(filePath, tableName) {
         }
 
         const rowData = tableColumns.map(c => toNullIfEmpty(row[c]));
-        batch.push({ visitId, rowData });
+        batch.push({ key: visitId, rowData });
         if (batch.length >= BATCH_SIZE) {
-          await processBatch(batch, tableName, tableColumns);
+          await processBatch(batch, tableName, tableColumns, 'Visit ID');
           insertedOrUpdated += batch.length;
           batch = [];
         }
       }
       if (batch.length) {
-        await processBatch(batch, tableName, tableColumns);
+        await processBatch(batch, tableName, tableColumns, 'Visit ID');
         insertedOrUpdated += batch.length;
       }
 
@@ -238,28 +247,124 @@ async function importMainTable(filePath, tableName) {
     }
   }
 
-async function processBatch(batch, tableName, tableColumns) {
+async function processBatch(batch, tableName, tableColumns, keyColumn) {
   const dedupedMap = new Map();
-  for (const item of batch) dedupedMap.set(item.visitId, item.rowData);
+  for (const item of batch) dedupedMap.set(item.key, item.rowData);
 
-  const dedupedBatch = Array.from(dedupedMap.entries()).map(([visitId, rowData]) => ({ visitId, rowData }));
+  const dedupedBatch = Array.from(dedupedMap.entries()).map(([key, rowData]) => ({ key, rowData }));
 
   const values = [];
   const placeholders = dedupedBatch.map((b, i) => {
     const rowPlaceholders = b.rowData.map((_, j) => `$${i * (tableColumns.length + 1) + j + 2}`);
-    values.push(b.visitId, ...b.rowData);
+    values.push(b.key, ...b.rowData);
     return `($${i * (tableColumns.length + 1) + 1}, ${rowPlaceholders.join(', ')})`;
   });
 
-  const colNames = ['"Visit ID"', ...tableColumns.map(c => `"${c}"`)];
+  const colNames = [`"${keyColumn}"`, ...tableColumns.map(c => `"${c}"`)];
   const updateSet = tableColumns.map(c => `"${c}" = EXCLUDED."${c}"`);
 
   const query = `
     INSERT INTO "${tableName}" (${colNames.join(', ')})
     VALUES ${placeholders.join(', ')}
-    ON CONFLICT ("Visit ID") DO UPDATE SET ${updateSet.join(', ')}
+    ON CONFLICT ("${keyColumn}") DO UPDATE SET ${updateSet.join(', ')}
   `;
   await client.query(query, values);
+}
+
+// ------------------ UNDUPLICATEDPATIENTS IMPORT ------------------
+async function importUnduplicatedPatients(filePath, tableName) {
+  const BATCH_SIZE = 500;
+  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  const skippedRows = [];
+  const deleteIds = new Set();
+  const csvMrns = new Set();
+  let minDate = null, maxDate = null;
+  let dateColumn = null;
+
+  const result = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const allColumns = result.rows.map(r => r.column_name);
+  const tableColumns = allColumns.filter(c => c !== 'MRN');
+  dateColumn = allColumns.find(c => /date/i.test(c));
+  await client.query('BEGIN');
+
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    for await (const row of parser) {
+      processedRows++;
+      const mrn = row['MRN'];
+      const action = (row['Action'] || '').toUpperCase();
+      const dateStr = dateColumn ? row[dateColumn] : null;
+      if (dateStr) {
+        const d = new Date(dateStr);
+        if (!isNaN(d)) {
+          if (!minDate || d < minDate) minDate = d;
+          if (!maxDate || d > maxDate) maxDate = d;
+        }
+      }
+
+      if (!mrn) {
+        skippedRows.push({ row, reason: 'Missing MRN' });
+        continue;
+      }
+
+      csvMrns.add(mrn);
+
+      if (action === 'DELETE') {
+        deleteIds.add(mrn);
+        continue;
+      }
+
+      const rowData = tableColumns.map(c => toNullIfEmpty(row[c]));
+      batch.push({ key: mrn, rowData });
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns, 'MRN');
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns, 'MRN');
+      insertedOrUpdated += batch.length;
+    }
+
+    if (deleteIds.size) {
+      const deleteRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "MRN" = ANY($1)`,
+        [Array.from(deleteIds)]
+      );
+      deletedCount += deleteRes.rowCount;
+    }
+
+    if (dateColumn && minDate && maxDate && csvMrns.size) {
+      const deleteExistingRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${dateColumn}" BETWEEN $1 AND $2 AND "MRN" NOT IN (SELECT unnest($3::text[]))`,
+        [minDate, maxDate, Array.from(csvMrns)]
+      );
+      deletedCount += deleteExistingRes.rowCount;
+    }
+
+    await client.query('COMMIT');
+    fs.unlinkSync(filePath);
+
+    return {
+      processedRows,
+      insertedOrUpdated,
+      deletedCount,
+      skippedRows: skippedRows.length,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
 }
 
 // ------------------ ROOT ------------------
