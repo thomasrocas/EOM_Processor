@@ -148,6 +148,9 @@ async function importMainTable(filePath, tableName) {
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
   const deleteIds = new Set();
+  const csvVisitIds = new Set();
+  let minDate = null, maxDate = null;
+  let dateColumn = null;
 
   const result = await client.query(`
     SELECT column_name
@@ -156,7 +159,9 @@ async function importMainTable(filePath, tableName) {
     ORDER BY ordinal_position
   `, [tableName]);
 
-  const tableColumns = result.rows.map(r => r.column_name).filter(c => c !== 'Visit ID');
+  const allColumns = result.rows.map(r => r.column_name);
+  const tableColumns = allColumns.filter(c => c !== 'Visit ID');
+  dateColumn = allColumns.find(c => /date/i.test(c));
   await client.query('BEGIN');
 
     try {
@@ -167,11 +172,21 @@ async function importMainTable(filePath, tableName) {
         processedRows++;
         const visitId = row['Visit ID'];
         const action = (row['Action'] || '').toUpperCase();
+        const dateStr = dateColumn ? row[dateColumn] : null;
+        if (dateStr) {
+          const d = new Date(dateStr);
+          if (!isNaN(d)) {
+            if (!minDate || d < minDate) minDate = d;
+            if (!maxDate || d > maxDate) maxDate = d;
+          }
+        }
 
         if (!visitId) {
           skippedRows.push({ row, reason: 'Missing Visit ID' });
           continue;
         }
+
+        csvVisitIds.add(visitId);
 
         if (action === 'DELETE') {
           deleteIds.add(visitId);
@@ -196,7 +211,15 @@ async function importMainTable(filePath, tableName) {
           `DELETE FROM "${tableName}" WHERE "Visit ID" = ANY($1)`,
           [Array.from(deleteIds)]
         );
-        deletedCount = deleteRes.rowCount;
+        deletedCount += deleteRes.rowCount;
+      }
+
+      if (dateColumn && minDate && maxDate && csvVisitIds.size) {
+        const deleteExistingRes = await client.query(
+          `DELETE FROM "${tableName}" WHERE "${dateColumn}" BETWEEN $1 AND $2 AND "Visit ID" NOT IN (SELECT unnest($3::text[]))`,
+          [minDate, maxDate, Array.from(csvVisitIds)]
+        );
+        deletedCount += deleteExistingRes.rowCount;
       }
 
       await client.query('COMMIT');
