@@ -221,7 +221,7 @@ async function importMainTable(filePath, tableName) {
 
       if (dateCol && minDate && maxDate && csvVisitIds.size) {
         const cleanupRes = await client.query(
-          `DELETE FROM "${tableName}" WHERE "${dateCol}" BETWEEN $1 AND $2 AND ("Visit ID" IS NULL OR "Visit ID" <> ALL($3))`,
+          `DELETE FROM "${tableName}" WHERE "${dateCol}" BETWEEN $1 AND $2 AND NOT ("Visit ID" = ANY($3))`,
           [minDate, maxDate, Array.from(csvVisitIds)]
         );
         deletedCount += cleanupRes.rowCount;
