@@ -1,0 +1,222 @@
+const express = require('express');
+const { Client } = require('pg');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const { parse } = require('csv-parse');
+const { stringify } = require('csv-stringify');
+const copyFrom = require('pg-copy-streams').from;
+const { Transform } = require('stream');
+
+const app = express();
+const PORT = 3000;
+
+const client = new Client({
+  user: 'postgres',
+  host: 'localhost',
+  database: 'clinicalvisits',
+  password: '@DbAdmin@',
+  port: 5432,
+});
+
+client.connect()
+  .then(() => console.log('✅ Connected to PostgreSQL!'))
+  .catch(err => console.error('❌ PostgreSQL connection error', err));
+
+const upload = multer({ dest: 'uploads/' });
+app.use(express.static('public'));
+app.use(express.urlencoded({ extended: true }));
+
+// ------------------ Helpers ------------------
+function toNullIfEmpty(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return s === '' ? null : s;
+}
+
+const CSV_OPTS_TOLERANT = {
+  columns: true,
+  trim: true,
+  skip_empty_lines: true,
+  relax_column_count: true,   // ✅ accept short/long rows
+  relax_quotes: true,         // ✅ handle stray quotes
+  bom: true,                  // ✅ handle UTF-8 BOM
+  skip_lines_with_error: true // ✅ silently skip broken lines
+};
+
+// ------------------ ROUTES ------------------
+app.post('/upload', upload.single('csvfile'), async (req, res) => {
+  const tableName = req.body.tableName;
+  const filePath = req.file?.path;
+
+  if (!filePath) return res.status(400).send('No file uploaded.');
+  if (!tableName) {
+    fs.unlinkSync(filePath);
+    return res.status(400).send('No table selected.');
+  }
+
+  try {
+    if (tableName === 'casemanager') {
+      await importCaseManager(filePath, tableName, res);
+    } else if (tableName === 'maintable') {
+      await importMainTable(filePath, tableName, res);
+    } else {
+      fs.unlinkSync(filePath);
+      return res.status(400).send('❌ Unknown table selected.');
+    }
+  } catch (err) {
+    console.error('❌ Server error:', err);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    res.status(500).send(`<pre>Server error: ${err.message}</pre>`);
+  }
+});
+
+// ------------------ CASEMANAGER IMPORT ------------------
+async function importCaseManager(filePath, tableName, res) {
+  try {
+    const result = await client.query(`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = $1
+      ORDER BY ordinal_position
+    `, [tableName]);
+
+    const tableColumns = result.rows.map(r => `"${r.column_name}"`);
+    const columnTypes = {};
+    result.rows.forEach(r => { columnTypes[r.column_name] = r.data_type; });
+
+    await client.query(`TRUNCATE TABLE "${tableName}"`);
+
+    function normalizeDate(v) {
+      if (!v) return '';
+      const d = new Date(v);
+      return isNaN(d) ? '' : d.toISOString().split('T')[0];
+    }
+
+    const isDateCol = {};
+    for (const [name, typ] of Object.entries(columnTypes)) {
+      isDateCol[name] = /\bdate\b/i.test(typ);
+    }
+
+    const reorderAndSanitize = new Transform({
+      writableObjectMode: true,
+      readableObjectMode: true,
+      transform(record, _enc, cb) {
+        const out = [];
+        for (const col of tableColumns) {
+          const plain = col.replace(/(^")|("$)/g, '');
+          let v = record[plain] ?? '';
+          if (isDateCol[plain]) v = normalizeDate(v);
+          out.push(v);
+        }
+        cb(null, out);
+      }
+    });
+
+    const copyStream = client.query(copyFrom(
+      `COPY "${tableName}" (${tableColumns.join(',')}) FROM STDIN CSV NULL ''`
+    ));
+
+    fs.createReadStream(filePath)
+      .pipe(parse({ columns: true, trim: true }))
+      .pipe(reorderAndSanitize)
+      .pipe(stringify({ header: false }))
+      .pipe(copyStream)
+      .on('finish', () => {
+        fs.unlinkSync(filePath);
+        res.send(`✅ CaseManager: Table "${tableName}" imported successfully!`);
+      })
+      .on('error', err => { throw err; });
+
+  } catch (err) {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+// ------------------ MAINTABLE IMPORT ------------------
+async function importMainTable(filePath, tableName, res) {
+  const BATCH_SIZE = 500;
+  let processedRows = 0, insertedOrUpdated = 0;
+  const skippedRows = [];
+
+  const result = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const tableColumns = result.rows.map(r => r.column_name).filter(c => c !== 'Visit ID');
+  await client.query('BEGIN');
+
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    for await (const row of parser) {
+      processedRows++;
+      const visitId = row['Visit ID'];
+      if (!visitId) {
+        skippedRows.push({ row, reason: 'Missing Visit ID' });
+        continue;
+      }
+      const rowData = tableColumns.map(c => toNullIfEmpty(row[c]));
+      batch.push({ visitId, rowData });
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns);
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns);
+      insertedOrUpdated += batch.length;
+    }
+
+    await client.query('COMMIT');
+    fs.unlinkSync(filePath);
+
+    res.send(`
+      ✅ MainTable Done!
+      Processed Rows: ${processedRows} 
+      Inserted/Updated: ${insertedOrUpdated} 
+      Skipped Rows: ${skippedRows.length}
+    `);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+async function processBatch(batch, tableName, tableColumns) {
+  const dedupedMap = new Map();
+  for (const item of batch) dedupedMap.set(item.visitId, item.rowData);
+
+  const dedupedBatch = Array.from(dedupedMap.entries()).map(([visitId, rowData]) => ({ visitId, rowData }));
+
+  const values = [];
+  const placeholders = dedupedBatch.map((b, i) => {
+    const rowPlaceholders = b.rowData.map((_, j) => `$${i * (tableColumns.length + 1) + j + 2}`);
+    values.push(b.visitId, ...b.rowData);
+    return `($${i * (tableColumns.length + 1) + 1}, ${rowPlaceholders.join(', ')})`;
+  });
+
+  const colNames = ['"Visit ID"', ...tableColumns.map(c => `"${c}"`)];
+  const updateSet = tableColumns.map(c => `"${c}" = EXCLUDED."${c}"`);
+
+  const query = `
+    INSERT INTO "${tableName}" (${colNames.join(', ')})
+    VALUES ${placeholders.join(', ')}
+    ON CONFLICT ("Visit ID") DO UPDATE SET ${updateSet.join(', ')}
+  `;
+  await client.query(query, values);
+}
+
+// ------------------ ROOT ------------------
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, () => console.log(`🚀 Unified server running at http://localhost:${PORT}`));
