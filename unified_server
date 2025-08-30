@@ -150,13 +150,23 @@ async function importMainTable(filePath, tableName) {
   const deleteIds = new Set();
 
   const result = await client.query(`
-    SELECT column_name
+    SELECT column_name, data_type
     FROM information_schema.columns
     WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
     ORDER BY ordinal_position
   `, [tableName]);
 
   const tableColumns = result.rows.map(r => r.column_name).filter(c => c !== 'Visit ID');
+  const dateCol = result.rows.find(r => r.data_type === 'date')?.column_name;
+
+  let minDate = null, maxDate = null;
+  const csvVisitIds = new Set();
+
+  function normalizeDate(v) {
+    if (!v) return '';
+    const d = new Date(v);
+    return isNaN(d) ? '' : d.toISOString().split('T')[0];
+  }
   await client.query('BEGIN');
 
     try {
@@ -171,6 +181,16 @@ async function importMainTable(filePath, tableName) {
         if (!visitId) {
           skippedRows.push({ row, reason: 'Missing Visit ID' });
           continue;
+        }
+
+        csvVisitIds.add(visitId);
+
+        if (dateCol) {
+          const dateVal = normalizeDate(row[dateCol]);
+          if (dateVal) {
+            if (!minDate || dateVal < minDate) minDate = dateVal;
+            if (!maxDate || dateVal > maxDate) maxDate = dateVal;
+          }
         }
 
         if (action === 'DELETE') {
@@ -196,7 +216,15 @@ async function importMainTable(filePath, tableName) {
           `DELETE FROM "${tableName}" WHERE "Visit ID" = ANY($1)`,
           [Array.from(deleteIds)]
         );
-        deletedCount = deleteRes.rowCount;
+        deletedCount += deleteRes.rowCount;
+      }
+
+      if (dateCol && minDate && maxDate && csvVisitIds.size) {
+        const cleanupRes = await client.query(
+          `DELETE FROM "${tableName}" WHERE "${dateCol}" BETWEEN $1 AND $2 AND NOT ("Visit ID" = ANY($3))`,
+          [minDate, maxDate, Array.from(csvVisitIds)]
+        );
+        deletedCount += cleanupRes.rowCount;
       }
 
       await client.query('COMMIT');
