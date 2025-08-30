@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>CSV Upload</title>
+</head>
+<body>
+  <form action="/upload" method="POST" enctype="multipart/form-data">
+    <label for="tableName">Select Table:</label>
+    <select name="tableName" id="tableName">
+      <option value="casemanager">Case Manager</option>
+      <option value="maintable">Main Table</option>
+      <option value="unduplicatedpatients">Unduplicated Patients</option>
+    </select>
+    <label for="csvfile">CSV File:</label>
+    <input type="file" name="csvfile" id="csvfile" accept=".csv" />
+    <button type="submit">Upload</button>
+  </form>
+</body>
+</html>
