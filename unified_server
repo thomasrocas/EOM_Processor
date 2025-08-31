@@ -278,6 +278,7 @@ async function importMainTable(filePath, tableName) {
   }
 
 async function processBatch(batch, tableName, tableColumns, keyColumns) {
+  const keys = Array.isArray(keyColumns) ? keyColumns : [keyColumns];
   const dedupedMap = new Map();
   for (const item of batch) {
     const keyString = item.keys.join('|');
@@ -290,16 +291,16 @@ async function processBatch(batch, tableName, tableColumns, keyColumns) {
   let paramIdx = 1;
   const placeholders = dedupedBatch.map(b => {
     const rowPlaceholders = [];
-    for (let i = 0; i < keyColumns.length + tableColumns.length; i++) {
+    for (let i = 0; i < keys.length + tableColumns.length; i++) {
       rowPlaceholders.push(`$${paramIdx++}`);
     }
     values.push(...b.keys, ...b.rowData);
     return `(${rowPlaceholders.join(', ')})`;
   });
 
-  const colNames = [...keyColumns.map(c => `"${c}"`), ...tableColumns.map(c => `"${c}"`)];
+  const colNames = [...keys.map(c => `"${c}"`), ...tableColumns.map(c => `"${c}"`)];
   const updateSet = tableColumns.map(c => `"${c}" = EXCLUDED."${c}"`);
-  const conflictCols = keyColumns.map(c => `"${c}"`).join(', ');
+  const conflictCols = keys.map(c => `"${c}"`).join(', ');
 
   const query = `
     INSERT INTO "${tableName}" (${colNames.join(', ')})
