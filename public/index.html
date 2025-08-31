@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>EOM Processor Upload</title>
+</head>
+<body>
+  <h1>Upload CSV</h1>
+  <form action="/upload" method="post" enctype="multipart/form-data">
+    <label for="tableName">Select Table:</label>
+    <select name="tableName" id="tableName">
+      <option value="casemanager">casemanager</option>
+      <option value="maintable">maintable</option>
+      <option value="unduplicatedpatients">unduplicatedpatients</option>
+      <option value="billed_ar_aging">billed_ar_aging</option>
+    </select>
+    <br>
+    <input type="file" name="csvfile" accept=".csv" required>
+    <button type="submit">Upload</button>
+  </form>
+</body>
+</html>
