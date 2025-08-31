@@ -107,6 +107,15 @@ app.post('/upload', upload.single('csvfile'), async (req, res) => {
         Deleted Rows: ${summary.deletedCount}
         Skipped Rows: ${summary.skippedRows}
       `);
+    } else if (tableName === 'queue_manager') {
+      const summary = await importQueueManager(filePath, tableName);
+      return res.send(`
+        ✅ QueueManager Done!
+        Processed Rows: ${summary.processedRows}
+        Inserted/Updated: ${summary.insertedOrUpdated}
+        Deleted Rows: ${summary.deletedCount}
+        Skipped Rows: ${summary.skippedRows}
+      `);
     } else {
       fs.unlinkSync(filePath);
       return res.status(400).send('❌ Unknown table selected.');
